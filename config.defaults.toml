@@ -1,0 +1,20 @@
+# reasonix-handoff broker defaults.
+# Override per-repo by creating .reasonix-broker/config.toml with the same shape.
+# Only flat "key = value" lines under a [section] are read (simple parser).
+
+# Which reasonix model each request-type runs as. Model is part of the session
+# key, so changing it here starts a new session lineage for that type.
+[models]
+codegen  = "deepseek-flash"
+review   = "deepseek-pro"
+openspec = "deepseek-pro"
+
+[limits]
+# Soft advisory the broker reports (active vs cap). Not hard-enforced; the
+# calling agent decides whether to reuse/queue beyond this.
+concurrency_cap = 4
+
+[run]
+# Default -max-steps passed to `reasonix run` when the caller doesn't set one
+# (0 = use reasonix config/default, i.e. no broker-imposed limit).
+max_steps = 0

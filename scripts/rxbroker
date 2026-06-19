@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# rxbroker — deterministic, idempotent broker for DeepSeek-Reasonix sessions.
+#
+# Brokers code-generation / code-review / openspec work to `reasonix`, reusing a
+# stable per-(repo,type,model,thread) session file so DeepSeek's prefix cache hits.
+#
+# Subcommands: key | ensure | run | list | promote | stop   (see `rxbroker help`)
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+
+# ---- dependency check ------------------------------------------------------
+for _bin in reasonix jq flock sha256sum; do
+  command -v "$_bin" >/dev/null 2>&1 || rxb_die "missing required tool: $_bin"
+done
+
+usage() {
+  cat <<'EOF'
+rxbroker — broker DeepSeek-Reasonix sessions for cache-stable agent handoff.
+
+Usage:
+  rxbroker key     --type T --thread ID [--model M] [--repo DIR]
+  rxbroker ensure  --type T --thread ID [--model M] [--repo DIR]
+  rxbroker run     --type T --thread ID [--model M] [--repo DIR]
+                   [--max-steps N] [--raw] (<task> | -)
+  rxbroker list    [--type T] [--thread ID] [--repo DIR]
+  rxbroker promote --type T --thread ID [--model M] [--repo DIR] [--addr HOST:PORT]
+  rxbroker stop    --type T --thread ID [--model M] [--repo DIR]
+
+Common flags:
+  --type      codegen | review | openspec   (forces a separate session lineage)
+  --thread    stable logical id; SAME id reconnects (cache hit), NEW id forks
+  --model     override the per-type model from config (changes the session key)
+  --repo      project dir (default: $PWD; resolves to git toplevel if any)
+  --max-steps reasonix tool-call round cap for `run` (0 = config default)
+  --raw       `run`: stream reasonix output as text instead of a JSON envelope
+  -           `run`: read the task prompt from stdin
+
+All commands print JSON to stdout (except `run --raw`).
+EOF
+}
+
+# ---- argument parsing ------------------------------------------------------
+TYPE="" THREAD="" REPO="$PWD" ADDR="" MAXSTEPS="" RAW=0
+RXB_MODEL_OVERRIDE=""
+POSITIONAL=()
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type)      TYPE="${2:-}"; shift 2 ;;
+      --thread)    THREAD="${2:-}"; shift 2 ;;
+      --model)     RXB_MODEL_OVERRIDE="${2:-}"; shift 2 ;;
+      --repo)      REPO="${2:-}"; shift 2 ;;
+      --addr)      ADDR="${2:-}"; shift 2 ;;
+      --max-steps) MAXSTEPS="${2:-}"; shift 2 ;;
+      --raw)       RAW=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      --)          shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+      -)           POSITIONAL+=("-"); shift ;;
+      -*)          rxb_die "unknown flag: $1" ;;
+      *)           POSITIONAL+=("$1"); shift ;;
+    esac
+  done
+}
+
+# Validate + derive the common (key, path, model) tuple for a session command.
+resolve_session() {
+  [ -n "$TYPE" ]   || rxb_die "--type is required"
+  rxb_is_type "$TYPE" || rxb_die "invalid --type '$TYPE' (want: $RXB_TYPES)"
+  [ -n "$THREAD" ] || rxb_die "--thread is required"
+  rxb_init_paths "$REPO"
+  MODEL=$(rxb_model_for "$TYPE")
+  KEY=$(rxb_key "$RXB_REPO_ID" "$TYPE" "$MODEL" "$THREAD")
+  SPATH_JSONL=$(rxb_session_path "$RXB_STATE" "$TYPE" "$KEY")
+}
+
+# Count sessions in the index for the soft concurrency advisory.
+concurrency_json() {
+  local active cap
+  active=$(jq 'length' "$RXB_INDEX" 2>/dev/null || echo 0)
+  cap=$(rxb_cfg_get limits concurrency_cap || echo 4)
+  jq -nc --argjson a "$active" --argjson c "$cap" \
+    '{active:$a, cap:$c, over: ($a > $c)}'
+}
+
+session_meta_json() { # status
+  jq -nc \
+    --arg key "$KEY" --arg path "$SPATH_JSONL" --arg type "$TYPE" \
+    --arg thread "$THREAD" --arg model "$MODEL" --arg repo "$RXB_REPO_ID" \
+    --arg status "${1:-}" \
+    '{key:$key, path:$path, type:$type, thread:$thread, model:$model, repo:$repo}
+     + (if $status=="" then {} else {status:$status} end)'
+}
+
+# ---- subcommand: key -------------------------------------------------------
+cmd_key() { resolve_session; session_meta_json; }
+
+# ---- subcommand: ensure ----------------------------------------------------
+# Idempotent: create the empty session file + index entry only if absent.
+# reasonix `run -resume` requires the file to pre-exist, so we own it as empty.
+cmd_ensure() {
+  resolve_session
+  rxb_index_init
+  mkdir -p "$(dirname "$SPATH_JSONL")" "$(rxb_locks_dir "$RXB_STATE")"
+  local status
+  if [ -f "$SPATH_JSONL" ] && rxb_index_get "$KEY" >/dev/null; then
+    status="reused"
+  else
+    [ -f "$SPATH_JSONL" ] || : > "$SPATH_JSONL"
+    rxb_index_apply "$KEY" \
+      ".[\$k] = ((.[\$k] // {}) + {type:\"$TYPE\", thread:\"$THREAD\", model:\"$MODEL\", path:\"$SPATH_JSONL\", turns:((.[\$k].turns)//0), created_at:((.[\$k].created_at)//$(rxb_now)), last_used:((.[\$k].last_used)//0)})"
+    status="created"
+  fi
+  session_meta_json "$status"
+}
+
+# ---- subcommand: run -------------------------------------------------------
+cmd_run() {
+  resolve_session
+  # task: from positional arg, or stdin when "-" (or no arg) is given.
+  local task=""
+  if [ "${#POSITIONAL[@]}" -gt 0 ] && [ "${POSITIONAL[0]}" != "-" ]; then
+    task="${POSITIONAL[0]}"
+  else
+    task="$(cat)"
+  fi
+  [ -n "$task" ] || rxb_die "run: empty task (pass <task> or pipe via -)"
+
+  local estatus
+  estatus=$(cmd_ensure | jq -r '.status')   # guarantees file + index entry; idempotent
+
+  local steps; steps="${MAXSTEPS:-$(rxb_cfg_get run max_steps || echo 0)}"
+  local lock="$(rxb_locks_dir "$RXB_STATE")/$KEY.lock"
+  local metrics out rc
+  metrics=$(mktemp); out=$(mktemp)
+
+  # Per-key lock serializes concurrent runs on the SAME session (protects the
+  # append-only JSONL + prefix invariant). Different keys run in parallel.
+  set +e
+  (
+    flock 8
+    reasonix run -dir "$RXB_REPO_ID" -model "$MODEL" -resume "$SPATH_JSONL" \
+      -max-steps "$steps" -metrics "$metrics" "$task" </dev/null
+  ) 8>"$lock" >"$out" 2>&1
+  rc=$?
+  set -e
+
+  rxb_index_apply "$KEY" \
+    ".[\$k].turns = ((.[\$k].turns)//0) + 1 | .[\$k].last_used = $(rxb_now)"
+
+  if [ "$RAW" -eq 1 ]; then
+    cat "$out"
+    rm -f "$metrics" "$out"
+    return "$rc"
+  fi
+
+  local turns; turns=$(rxb_index_get "$KEY" | jq '.turns // 0')
+  # Strip ANSI escapes from captured output for clean embedding.
+  sed -r 's/\x1b\[[0-9;]*[A-Za-z]//g' "$out" > "$out.clean" || cp "$out" "$out.clean"
+  jq -n \
+    --argjson meta "$(session_meta_json "$estatus")" \
+    --argjson conc "$(concurrency_json)" \
+    --slurpfile metrics "$metrics" \
+    --rawfile output "$out.clean" \
+    --argjson turns "${turns:-0}" \
+    --argjson exit "$rc" \
+    '$meta + {turns:$turns, exit:$exit,
+              metrics: ($metrics[0] // null),
+              concurrency: $conc,
+              output: $output}'
+  rm -f "$metrics" "$out" "$out.clean"
+  return "$rc"
+}
+
+# ---- subcommand: list ------------------------------------------------------
+cmd_list() {
+  rxb_init_paths "$REPO"
+  rxb_index_init
+  jq --arg type "$TYPE" --arg thread "$THREAD" '
+    to_entries
+    | map(.value + {key: .key})
+    | map(select($type   == "" or .type   == $type))
+    | map(select($thread == "" or .thread == $thread))
+  ' "$RXB_INDEX"
+}
+
+# ---- subcommand: promote (opt-in serve) ------------------------------------
+cmd_promote() {
+  resolve_session
+  [ -f "$SPATH_JSONL" ] || rxb_die "promote: no session for that key; run `ensure`/`run` first"
+  local addr="${ADDR:-127.0.0.1:8787}"
+  local logf="$RXB_STATE/serve-$KEY.log"
+  nohup reasonix serve -model "$MODEL" -resume "$SPATH_JSONL" -addr "$addr" \
+    >"$logf" 2>&1 &
+  local pid=$!
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rxb_die "promote: serve failed to start (see $logf)"
+  fi
+  rxb_index_apply "$KEY" \
+    ".[\$k].serve = {addr:\"$addr\", pid:$pid, log:\"$logf\"}"
+  session_meta_json reused \
+    | jq --arg addr "$addr" --argjson pid "$pid" --arg log "$logf" \
+        '. + {serve:{addr:$addr, pid:$pid, log:$log, url:("http://"+$addr+"/")}}'
+}
+
+# ---- subcommand: stop ------------------------------------------------------
+cmd_stop() {
+  resolve_session
+  local entry pid
+  entry=$(rxb_index_get "$KEY" || true)
+  pid=$(printf '%s' "$entry" | jq -r '.serve.pid // empty')
+  if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+  rxb_index_apply "$KEY" "if .[\$k] then .[\$k] |= del(.serve) else . end"
+  session_meta_json reused | jq '. + {stopped:true}'
+}
+
+# ---- dispatch --------------------------------------------------------------
+[ $# -ge 1 ] || { usage; exit 1; }
+SUB="$1"; shift
+parse_args "$@"
+case "$SUB" in
+  key)     cmd_key ;;
+  ensure)  cmd_ensure ;;
+  run)     cmd_run ;;
+  list)    cmd_list ;;
+  promote) cmd_promote ;;
+  stop)    cmd_stop ;;
+  help|-h|--help) usage ;;
+  *) rxb_die "unknown subcommand '$SUB' (see `rxbroker help`)" ;;
+esac
