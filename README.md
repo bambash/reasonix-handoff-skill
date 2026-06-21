@@ -1,6 +1,6 @@
 # reasonix-handoff
 
-> Claude Code skill for brokering work to a local [DeepSeek](https://deepseek.ai) model via the [`reasonix`](https://reasonix.ai) CLI, with deterministic session reuse for **~28x cheaper** cached inference.
+> Agent skill for brokering work to a local [DeepSeek](https://deepseek.ai) model via the [`reasonix`](https://reasonix.ai) CLI, with deterministic session reuse for **~28x cheaper** cached inference.
 
 ## What is this?
 
