@@ -11,6 +11,7 @@
 - **Cost**: A resumed turn on the same session costs ~0.0003 yen vs. ~0.0084 yen cold (verified on `deepseek-v4-flash`). That's ~28x savings.
 - **Determinism**: Sessions are keyed by `sha256(repo\0type\0model\0thread)`, so the same request always reconnects to the same transcript.
 - **Concurrency**: Up to 4 concurrent sessions, with soft advisory capping and queueing guidance.
+- **Harness-friendly**: `capabilities` and `run-task` provide a JSON protocol for sub-agent orchestration.
 - **Self-contained**: All state lives in `.reasonix-broker/` per-repo — no external database, no daemon.
 
 ## Requirements
@@ -91,6 +92,18 @@ key = sha256(repo_id \0 type \0 model \0 thread)[0:16]
 | `review`   | `deepseek-pro`     | Read-only code review and analysis           |
 | `openspec` | `deepseek-pro`     | OpenSpec proposal, spec, and task generation |
 
+### Sub-agent Roles
+
+Other harnesses can map higher-level sub-agent roles onto the same broker request types:
+
+| Role | Type | Writes | Use |
+|------|------|-------:|-----|
+| `planner` | `openspec` | no | Plan work or draft OpenSpec artifacts |
+| `implementer` | `codegen` | yes | Modify code for a scoped artifact |
+| `reviewer` | `review` | no | Critique code, diffs, specs, or plans |
+| `tester` | `review` | no | Run or design verification without editing by default |
+| `fixer` | `codegen` | yes | Apply focused fixes after review or test failure |
+
 ## Commands
 
 Always invoke through `scripts/rxbroker` — **never call `reasonix` directly**.
@@ -100,7 +113,7 @@ Always invoke through `scripts/rxbroker` — **never call `reasonix` directly**.
 Print the deterministic key for a given session without creating it.
 
 ```
-rxbroker --type codegen --thread "add-auth-middleware" key
+rxbroker key --type codegen --thread "add-auth-middleware"
 ```
 
 Outputs JSON:
@@ -120,7 +133,7 @@ Outputs JSON:
 Idempotent session factory. Creates the JSONL file and index entry if they don't exist.
 
 ```
-rxbroker --type codegen --thread "add-auth-middleware" ensure
+rxbroker ensure --type codegen --thread "add-auth-middleware"
 ```
 
 Output:
@@ -137,7 +150,7 @@ or
 The main command. Calls `ensure`, acquires a per-key `flock` (serializing concurrent runs on the same session to protect the append-only JSONL and prefix invariant), then invokes `reasonix run -resume <path>`.
 
 ```
-rxbroker --type codegen --thread "add-auth-middleware" run \
+rxbroker run --type codegen --thread "add-auth-middleware" \
   "Write a FastAPI auth middleware with JWT validation"
 ```
 
@@ -145,7 +158,7 @@ Or pipe the prompt via stdin:
 
 ```
 echo "Write a FastAPI auth middleware with JWT validation" | \
-  rxbroker --type codegen --thread "add-auth-middleware" run -
+  rxbroker run --type codegen --thread "add-auth-middleware" -
 ```
 
 Output is a JSON envelope:
@@ -180,8 +193,50 @@ Output is a JSON envelope:
 
 Use `--raw` to stream plain text output instead of JSON:
 ```
-rxbroker --raw --type codegen --thread "add-auth-middleware" run "Write code..."
+rxbroker run --raw --type codegen --thread "add-auth-middleware" "Write code..."
 ```
+
+Use `--agent` to echo sub-agent identity in the JSON envelope:
+
+```
+rxbroker run --type codegen --thread "add-auth-middleware" \
+  --agent implementer-1 "Write code..."
+```
+
+### `rxbroker capabilities`
+
+Print machine-readable protocol metadata for another harness.
+
+```
+rxbroker capabilities --repo /path/to/repo
+```
+
+The response includes `protocol: "reasonix-handoff/v1"`, supported commands, request types,
+role mappings, configured models, task-envelope fields, result-contract fields, concurrency
+limits, and whether `reasonix` is available.
+
+### `rxbroker run-task`
+
+Run a portable JSON task envelope. This is the preferred interface for sub-agent driven
+development from another harness.
+
+```
+rxbroker run-task task.json
+```
+
+Minimum task:
+
+```json
+{
+  "type": "codegen",
+  "thread": "add-rate-limiter",
+  "agent": "implementer-1",
+  "objective": "Implement rate limiting middleware."
+}
+```
+
+The task may also include `repo`, `model`, `max_steps`, `scope`, `constraints`,
+`expected_output`, and `result_schema`. The full envelope is forwarded to Reasonix.
 
 ### `rxbroker list`
 
@@ -189,8 +244,8 @@ List all known sessions, optionally filtered.
 
 ```
 rxbroker list
-rxbroker --type codegen list
-rxbroker --thread "add-auth-middleware" list
+rxbroker list --type codegen
+rxbroker list --thread "add-auth-middleware"
 ```
 
 ### `rxbroker promote`
@@ -198,7 +253,7 @@ rxbroker --thread "add-auth-middleware" list
 Promote a session to a long-running server (`reasonix serve`) for live observation, streaming, or sharing across processes.
 
 ```
-rxbroker --type codegen --thread "add-auth-middleware" promote --addr "localhost:9090"
+rxbroker promote --type codegen --thread "add-auth-middleware" --addr "localhost:9090"
 ```
 
 Starts the server in the background, persists the `serve` entry in the index.
@@ -208,7 +263,7 @@ Starts the server in the background, persists the `serve` entry in the index.
 Kill the `serve` process for a session.
 
 ```
-rxbroker --type codegen --thread "add-auth-middleware" stop
+rxbroker stop --type codegen --thread "add-auth-middleware"
 ```
 
 ## Directory Layout

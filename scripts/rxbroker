@@ -4,7 +4,8 @@
 # Brokers code-generation / code-review / openspec work to `reasonix`, reusing a
 # stable per-(repo,type,model,thread) session file so DeepSeek's prefix cache hits.
 #
-# Subcommands: key | ensure | run | list | promote | stop   (see `rxbroker help`)
+# Subcommands: key | ensure | run | run-task | list | capabilities | promote | stop
+# (see `rxbroker help`)
 set -euo pipefail
 
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -12,9 +13,13 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SELF_DIR/lib/common.sh"
 
 # ---- dependency check ------------------------------------------------------
-for _bin in reasonix jq flock sha256sum; do
+for _bin in jq flock sha256sum; do
   command -v "$_bin" >/dev/null 2>&1 || rxb_die "missing required tool: $_bin"
 done
+
+rxb_need_reasonix() {
+  command -v reasonix >/dev/null 2>&1 || rxb_die "missing required tool: reasonix"
+}
 
 usage() {
   cat <<'EOF'
@@ -24,8 +29,10 @@ Usage:
   rxbroker key     --type T --thread ID [--model M] [--repo DIR]
   rxbroker ensure  --type T --thread ID [--model M] [--repo DIR]
   rxbroker run     --type T --thread ID [--model M] [--repo DIR]
-                   [--max-steps N] [--raw] (<task> | -)
+                   [--agent NAME] [--max-steps N] [--raw] (<task> | -)
+  rxbroker run-task TASK.json [--raw]
   rxbroker list    [--type T] [--thread ID] [--repo DIR]
+  rxbroker capabilities [--repo DIR]
   rxbroker promote --type T --thread ID [--model M] [--repo DIR] [--addr HOST:PORT]
   rxbroker stop    --type T --thread ID [--model M] [--repo DIR]
 
@@ -34,16 +41,20 @@ Common flags:
   --thread    stable logical id; SAME id reconnects (cache hit), NEW id forks
   --model     override the per-type model from config (changes the session key)
   --repo      project dir (default: $PWD; resolves to git toplevel if any)
+  --agent     optional calling sub-agent id; echoed in JSON envelopes
   --max-steps reasonix tool-call round cap for `run` (0 = config default)
   --raw       `run`: stream reasonix output as text instead of a JSON envelope
   -           `run`: read the task prompt from stdin
+
+run-task expects a JSON file with: type, thread, optional repo/model/agent/max_steps,
+and either prompt or objective. The full task envelope is forwarded to reasonix.
 
 All commands print JSON to stdout (except `run --raw`).
 EOF
 }
 
 # ---- argument parsing ------------------------------------------------------
-TYPE="" THREAD="" REPO="$PWD" ADDR="" MAXSTEPS="" RAW=0
+TYPE="" THREAD="" REPO="$PWD" ADDR="" MAXSTEPS="" RAW=0 AGENT=""
 RXB_MODEL_OVERRIDE=""
 POSITIONAL=()
 parse_args() {
@@ -53,6 +64,7 @@ parse_args() {
       --thread)    THREAD="${2:-}"; shift 2 ;;
       --model)     RXB_MODEL_OVERRIDE="${2:-}"; shift 2 ;;
       --repo)      REPO="${2:-}"; shift 2 ;;
+      --agent)     AGENT="${2:-}"; shift 2 ;;
       --addr)      ADDR="${2:-}"; shift 2 ;;
       --max-steps) MAXSTEPS="${2:-}"; shift 2 ;;
       --raw)       RAW=1; shift ;;
@@ -89,8 +101,9 @@ session_meta_json() { # status
   jq -nc \
     --arg key "$KEY" --arg path "$SPATH_JSONL" --arg type "$TYPE" \
     --arg thread "$THREAD" --arg model "$MODEL" --arg repo "$RXB_REPO_ID" \
-    --arg status "${1:-}" \
+    --arg agent "$AGENT" --arg status "${1:-}" \
     '{key:$key, path:$path, type:$type, thread:$thread, model:$model, repo:$repo}
+     + (if $agent=="" then {} else {agent:$agent} end)
      + (if $status=="" then {} else {status:$status} end)'
 }
 
@@ -118,6 +131,7 @@ cmd_ensure() {
 
 # ---- subcommand: run -------------------------------------------------------
 cmd_run() {
+  rxb_need_reasonix
   resolve_session
   # task: from positional arg, or stdin when "-" (or no arg) is given.
   local task=""
@@ -174,6 +188,80 @@ cmd_run() {
   return "$rc"
 }
 
+# ---- subcommand: run-task --------------------------------------------------
+cmd_run_task() {
+  [ "${#POSITIONAL[@]}" -gt 0 ] || rxb_die "run-task: TASK.json is required"
+  local task_file="${POSITIONAL[0]}"
+  [ -f "$task_file" ] || rxb_die "run-task: file not found: $task_file"
+  jq -e 'type == "object"' "$task_file" >/dev/null || rxb_die "run-task: TASK.json must be a JSON object"
+
+  local file_type file_thread file_repo file_model file_agent file_steps prompt
+  file_type=$(jq -r '.type // empty' "$task_file")
+  file_thread=$(jq -r '.thread // empty' "$task_file")
+  file_repo=$(jq -r '.repo // empty' "$task_file")
+  file_model=$(jq -r '.model // empty' "$task_file")
+  file_agent=$(jq -r '.agent // empty' "$task_file")
+  file_steps=$(jq -r '.max_steps // empty' "$task_file")
+
+  TYPE="${TYPE:-$file_type}"
+  THREAD="${THREAD:-$file_thread}"
+  [ "$REPO" = "$PWD" ] && [ -n "$file_repo" ] && REPO="$file_repo"
+  RXB_MODEL_OVERRIDE="${RXB_MODEL_OVERRIDE:-$file_model}"
+  AGENT="${AGENT:-$file_agent}"
+  MAXSTEPS="${MAXSTEPS:-$file_steps}"
+
+  [ -n "$TYPE" ] || rxb_die "run-task: missing required field: type"
+  [ -n "$THREAD" ] || rxb_die "run-task: missing required field: thread"
+  jq -e 'has("prompt") or has("objective")' "$task_file" >/dev/null \
+    || rxb_die "run-task: TASK.json must include prompt or objective"
+
+  prompt=$(jq -r '
+    "You are a Reasonix sub-agent invoked by rxbroker using the reasonix-handoff/v1 protocol.\n" +
+    "Follow the task envelope exactly. Respect scope and constraints. Prefer minimal, focused changes.\n" +
+    "Return your final answer as either valid JSON matching expected_output/result_schema when requested, or concise Markdown otherwise.\n\n" +
+    "TASK_ENVELOPE:\n" + (. | tojson)
+  ' "$task_file")
+
+  POSITIONAL=("$prompt")
+  cmd_run
+}
+
+# ---- subcommand: capabilities ---------------------------------------------
+cmd_capabilities() {
+  rxb_init_paths "$REPO"
+  local cap codegen_model review_model openspec_model reasonix_ok
+  cap=$(rxb_cfg_get limits concurrency_cap || echo 4)
+  codegen_model=$(rxb_cfg_get models codegen || echo "")
+  review_model=$(rxb_cfg_get models review || echo "")
+  openspec_model=$(rxb_cfg_get models openspec || echo "")
+  if command -v reasonix >/dev/null 2>&1; then reasonix_ok=true; else reasonix_ok=false; fi
+  jq -nc \
+    --arg repo "$RXB_REPO_ID" \
+    --argjson reasonix_available "$reasonix_ok" \
+    --argjson cap "$cap" \
+    --arg codegen_model "$codegen_model" \
+    --arg review_model "$review_model" \
+    --arg openspec_model "$openspec_model" \
+    '{
+      protocol:"reasonix-handoff/v1",
+      repo:$repo,
+      commands:["key","ensure","run","run-task","list","capabilities","promote","stop"],
+      types:["codegen","review","openspec"],
+      models:{codegen:$codegen_model, review:$review_model, openspec:$openspec_model},
+      roles:{
+        planner:{type:"openspec", writes:false, description:"Plan or draft OpenSpec artifacts."},
+        implementer:{type:"codegen", writes:true, description:"Modify code for a scoped artifact."},
+        reviewer:{type:"review", writes:false, description:"Critique code, diffs, specs, or plans."},
+        tester:{type:"review", writes:false, description:"Run or design verification without editing by default."},
+        fixer:{type:"codegen", writes:true, description:"Apply focused fixes after review or test failure."}
+      },
+      task_envelope:{required:["type","thread"], one_of:["prompt","objective"], optional:["repo","model","agent","max_steps","scope","constraints","expected_output","result_schema"]},
+      result_contract:{status:["completed","blocked","failed"], fields:["summary","files_changed","tests_run","issues","next_steps"]},
+      limits:{concurrency_cap:$cap},
+      reasonix_available:$reasonix_available
+    }'
+}
+
 # ---- subcommand: list ------------------------------------------------------
 cmd_list() {
   rxb_init_paths "$REPO"
@@ -188,6 +276,7 @@ cmd_list() {
 
 # ---- subcommand: promote (opt-in serve) ------------------------------------
 cmd_promote() {
+  rxb_need_reasonix
   resolve_session
   [ -f "$SPATH_JSONL" ] || rxb_die "promote: no session for that key; run `ensure`/`run` first"
   local addr="${ADDR:-127.0.0.1:8787}"
@@ -222,12 +311,14 @@ cmd_stop() {
 SUB="$1"; shift
 parse_args "$@"
 case "$SUB" in
-  key)     cmd_key ;;
-  ensure)  cmd_ensure ;;
-  run)     cmd_run ;;
-  list)    cmd_list ;;
-  promote) cmd_promote ;;
-  stop)    cmd_stop ;;
+  key)          cmd_key ;;
+  ensure)       cmd_ensure ;;
+  run)          cmd_run ;;
+  run-task)     cmd_run_task ;;
+  list)         cmd_list ;;
+  capabilities) cmd_capabilities ;;
+  promote)      cmd_promote ;;
+  stop)         cmd_stop ;;
   help|-h|--help) usage ;;
   *) rxb_die "unknown subcommand '$SUB' (see `rxbroker help`)" ;;
 esac

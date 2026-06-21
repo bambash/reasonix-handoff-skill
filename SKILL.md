@@ -12,8 +12,8 @@ cheaper on resume). Independent workstreams run as separate sessions (multi-thre
 
 ## The one rule
 
-**Always go through `rxbroker run`. Never call `reasonix` directly.** Direct calls fork
-uncontrolled sessions and break the cache contract.
+**Always go through `rxbroker run` or `rxbroker run-task`. Never call `reasonix` directly.**
+Direct calls fork uncontrolled sessions and break the cache contract.
 
 ```
 RXB=~/.claude/skills/reasonix-handoff/scripts/rxbroker
@@ -39,9 +39,11 @@ RXB=~/.claude/skills/reasonix-handoff/scripts/rxbroker
 | Command | Purpose |
 |---|---|
 | `$RXB run --type T --thread ID [--max-steps N] [--raw] (<task> \| -)` | Ensure + cache-stable resume + run. The workhorse. |
+| `$RXB run-task TASK.json [--raw]` | Harness-facing JSON task envelope runner. |
 | `$RXB ensure --type T --thread ID` | Idempotently create/resolve a session without running. |
 | `$RXB key --type T --thread ID` | Print the computed key/path (determinism check). |
 | `$RXB list [--type T] [--thread ID]` | JSON of known sessions (turns, last_used, serve). |
+| `$RXB capabilities [--repo DIR]` | Machine-readable protocol, roles, limits, and command discovery. |
 | `$RXB promote --type T --thread ID [--addr H:P]` | Bind a live `reasonix serve` (HTTP+SSE) to the session. Opt-in. |
 | `$RXB stop --type T --thread ID` | Stop that session's serve process. |
 
@@ -49,6 +51,12 @@ RXB=~/.claude/skills/reasonix-handoff/scripts/rxbroker
 metrics:{cache_hit_tokens, cache_miss_tokens, cost, ...}, concurrency, output}`. Read
 `.output` for the result and `.metrics` to confirm the cache is working. Use `--raw` for
 plain streamed text instead of the envelope.
+
+For sub-agent driven harnesses, call `capabilities` first, then submit JSON envelopes with
+`run-task`. The protocol name is `reasonix-handoff/v1`; conventional roles are `planner`,
+`implementer`, `reviewer`, `tester`, and `fixer`, mapped onto the same three request types.
+Use `--agent NAME` or the task envelope's `agent` field to echo sub-agent identity in broker
+responses.
 
 ## Examples
 
@@ -62,6 +70,10 @@ git diff | $RXB run --type review --thread pr-482 -
 # OpenSpec change, keyed by change id so every step accumulates cache:
 $RXB run --type openspec --thread add-user-auth "Draft tasks.md for this change"
 
+# Harness discovery and portable JSON task execution:
+$RXB capabilities --repo /path/to/repo
+$RXB run-task task.json
+
 # Promote a hot session to a live server, then tear down:
 $RXB promote --type codegen --thread add-rate-limiter --addr 127.0.0.1:8790
 $RXB stop    --type codegen --thread add-rate-limiter
@@ -71,6 +83,8 @@ $RXB stop    --type codegen --thread add-rate-limiter
 
 - `reference/prompt-template.md` — the brokering policy to follow when driving `rxbroker`
   (thread-id discipline, reuse-vs-new, multi-threading, when to promote to `serve`).
+- `reference/subagent-protocol.md` — the machine-facing protocol for other harnesses that
+  orchestrate planner/implementer/reviewer/tester/fixer sub-agents through `rxbroker`.
 - `reference/reasonix-cli.md` — underlying `reasonix` flags, the prefix-cache invariant, and
   the verified `-resume`/`-metrics` behavior the broker depends on.
 

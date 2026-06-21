@@ -12,6 +12,16 @@ RXB=~/.claude/skills/reasonix-handoff/scripts/rxbroker
 
 You broker DeepSeek work through `rxbroker`. You never call `reasonix` directly.
 
+If you are another harness orchestrating sub-agents, start with machine discovery:
+
+```bash
+$RXB capabilities --repo <repo>
+```
+
+Use the returned `reasonix-handoff/v1` protocol metadata to pick a request type, role, and
+thread id. The broker remains the session/cache authority; the harness remains responsible for
+scheduling, permissions, and parsing sub-agent results.
+
 For every request, decide three things:
 
 1. **type** — what kind of work this is:
@@ -46,12 +56,36 @@ For every request, decide three things:
 $RXB run --type codegen --thread <id> "<task>"
 # Large/structured prompt via stdin:
 cat prompt.md | $RXB run --type review --thread <id> -
+# Attribute the calling sub-agent in the JSON envelope:
+$RXB run --type codegen --thread <id> --agent implementer-1 "<task>"
 # Override the model for one request (changes the session key → new lineage):
 $RXB run --type codegen --thread <id> --model deepseek-pro "<task>"
 ```
 
+Harnesses can submit a portable JSON task envelope:
+
+```bash
+$RXB run-task task.json
+```
+
+Minimum envelope:
+
+```json
+{
+  "type": "codegen",
+  "thread": "add-rate-limiter",
+  "agent": "implementer-1",
+  "objective": "Implement rate limiting middleware."
+}
+```
+
+`run-task` accepts `type`, `thread`, optional `repo`, `model`, `agent`, `max_steps`, and either
+`prompt` or `objective`. It forwards the full envelope to Reasonix so the sub-agent sees scope,
+constraints, and expected output metadata.
+
 Parse the JSON envelope:
 - `.output` — the model's result (use this).
+- `.agent` — optional calling sub-agent id when supplied.
 - `.status` — `created` (new session) or `reused` (reconnected).
 - `.metrics.cache_hit_tokens` / `.metrics.cache_miss_tokens` — confirm the cache is working;
   a healthy resumed session shows hit ≫ miss.
@@ -61,6 +95,20 @@ Parse the JSON envelope:
 Thread these back into follow-ups: keep using the same `--type`/`--thread` to stay on the
 cached session. You don't need to track `key`/`path` yourself — the broker derives them
 deterministically from `(repo, type, model, thread)`.
+
+When a task envelope asks for JSON, request this result shape from the sub-agent and parse it
+from `.output`:
+
+```json
+{
+  "status": "completed | blocked | failed",
+  "summary": "What changed or what was found.",
+  "files_changed": [],
+  "tests_run": [],
+  "issues": [],
+  "next_steps": []
+}
+```
 
 ## When to promote to `serve`
 
